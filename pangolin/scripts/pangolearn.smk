@@ -65,38 +65,87 @@ rule parse_paf:
                     unmapped.write(f"{record.id},failed to map\n")
                     
 
-rule minimap2_to_reference:
+rule align_to_reference:
     input:
         fasta = rules.parse_paf.output.fasta,
         reference = config["reference_fasta"]
+    params:
+            trim_start = config["trim_start"],
+            trim_end = config["trim_end"],
     output:
-        sam = os.path.join(config["tempdir"],"reference_mapped.sam")
+        fasta = os.path.join(config["tempdir"],"post_qc_query.aligned.fasta")
     log:
         os.path.join(config["tempdir"], "logs/minimap2_sam.log")
     shell:
         """
-        minimap2 -a -x asm5 -t {workflow.cores} {input.reference:q} {input.fasta:q} -o {output.sam:q} &> {log}
+        minimap2 -a -x asm5 -t {workflow.cores} {input.reference:q} {input.fasta:q} | \
+        gofasta sam toMultiAlign \
+            --reference {input.reference:q} \
+            --trimstart {params.trim_start} \
+            --trimend {params.trim_end} \
+            --pad \> {output.fasta:q}
         """
 
-rule datafunk_trim_and_pad:
+rule parse_variants_input:
     input:
-        sam = rules.minimap2_to_reference.output.sam,
-        reference = config["reference_fasta"]
-    params:
-        trim_start = config["trim_start"],
-        trim_end = config["trim_end"],
-        insertions = os.path.join(config["tempdir"],"insertions.txt")
+        config["variants_csv"]
     output:
-        fasta = os.path.join(config["tempdir"],"post_qc_query.aligned.fasta")
+        os.path.join(config["tempdir"], "search_variants.csv")
+    run:
+        def record_to_variant(record):
+            if record["type"] == 'deletion':
+                return "del:%s:%s" %(record["nuc_location"],record["variants"])
+            elif record["type"] == 'replacement':
+                return "aa:%s" %record["id"]
+            return None
+
+        variant_dict = {}
+        with open(input[0], 'r') as in_handle:
+            reader = csv.DictReader(in_handle)
+            for r in reader:
+                variant = record_to_variant(r)
+                order = int(r["barcode_pos"])
+                variant_dict[order] = variant
+
+        with open(output[0], 'w') as out_handle:
+            for i in range(len(variant_dict)):
+                out_handle.write("%s\n" %variant_dict[i])
+
+
+
+rule type_variants:
+    input:
+        fasta = rules.gisaid_unify_headers.output.fasta,
+        reference = config["reference_fasta"],
+        variants = rules.parse_variants_input.output
+    output:
+        os.path.join(config["tempdir"], "typed_variants.csv")
+    log:
+        config["outdir"] + "/logs/2_type_variants.log"
     shell:
         """
-        datafunk sam_2_fasta \
-          -s {input.sam:q} \
-          -r {input.reference:q} \
-          -o {output.fasta:q} \
-          -t [{params.trim_start}:{params.trim_end}] \
-          --pad \
-          --log-inserts 
+        type_variants.py \
+            --fasta-in {input.fasta:q} \
+            --variants-config {input.variants:q} \
+            --reference {input.reference:q} \
+            --variants-out {output:q} \
+            --append-genotypes &> {log}
+        """
+
+rule generate_constellation_strings:
+    input:
+        variants = config["variants_csv"],
+        variant_calls = rules.type_variants.output
+    output:
+        os.path.join(config["tempdir"], "constellation_report.csv")
+    log:
+        config["outdir"] + "/logs/2_generate_constellation_strings.log"
+    shell:
+        """
+        generate_constellation.py \
+            --variant-ref {input.variants:q} \
+            --variant-calls {input.variant_calls:q} \
+            --out-file {output[0]:q} &> {log}
         """
 
 rule pangolearn:
